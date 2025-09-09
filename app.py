@@ -1,3 +1,18 @@
+import sys
+from pathlib import Path
+
+# --- Bootstrap de rutas para encontrar 'components' aunque esté un nivel más allá ---
+ROOT = Path(__file__).resolve().parent
+candidate_roots = [ROOT]
+# también revisa subcarpetas directas por si subiste todo dentro de una carpeta
+candidate_roots += [p for p in ROOT.iterdir() if p.is_dir()]
+
+for base in candidate_roots:
+    if (base / "components" / "__init__.py").exists():
+        if str(base) not in sys.path:
+            sys.path.insert(0, str(base))
+        break
+# -----------------------------------------------------------------------------------
 
 import streamlit as st, pandas as pd, numpy as np, sys
 from pathlib import Path
