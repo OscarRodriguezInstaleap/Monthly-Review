@@ -9,6 +9,14 @@ from components.cihs import cihs_section
 from components.alerts import churn_alerts
 from components.map import map_by_country
 
+from pathlib import Path
+ASSETS = Path(__file__).resolve().parent / "assets"
+css_file = ASSETS / "style.css"
+if css_file.exists():
+    st.markdown(f"<style>{css_file.read_text()}</style>", unsafe_allow_html=True)
+else:
+    st.warning("No se encontró assets/style.css (revisa que la carpeta exista en el repo y esté en la raíz).")
+
 st.set_page_config(page_title="Instaleap BI — Revenue & Health", layout="wide")
 st.markdown('<style>' + open('assets/style.css').read() + '</style>', unsafe_allow_html=True)
 
