@@ -8,6 +8,7 @@ from components.cohort import yoy_cohort_stacked
 from components.cihs import cihs_section
 from components.alerts import churn_alerts
 from components.map import map_by_country
+from components.sources import load_from_public_sheets
 
 from pathlib import Path
 ASSETS = Path(__file__).resolve().parent / "assets"
@@ -20,12 +21,32 @@ else:
 st.set_page_config(page_title="Instaleap BI — Revenue & Health", layout="wide")
 st.markdown('<style>' + open('assets/style.css').read() + '</style>', unsafe_allow_html=True)
 
-st.sidebar.title("Configuración")
-uploaded = st.sidebar.file_uploader("Sube tu archivo (.csv o .xlsx)", type=["csv","xlsx","xls"])
-horizon = st.sidebar.slider("Horizonte de pronóstico (meses)", 1, 12, 6)
-aggregate_first = st.sidebar.radio("Método de consolidación", ["Agregue y pronostique", "Pronostique por cliente y agregue"], index=0)
-aggregate_first = (aggregate_first == "Agregue y pronostique")
-grouping = st.sidebar.multiselect("Agrupar resultados por", options=["zona","type","nuevo"], default=["zona","type"])
+# Sidebar en app.py
+data_source = st.sidebar.selectbox("Fuente de datos", ["Archivo", "Google Sheets (público)"], index=0)
+
+if data_source == "Archivo":
+    uploaded = st.sidebar.file_uploader("Sube tu archivo (.csv o .xlsx)", type=["csv","xlsx","xls"])
+    if uploaded is not None:
+        # Carga como ya lo hacías:
+        import pandas as pd
+        if uploaded.name.lower().endswith(('.xlsx', '.xls')):
+            tables = pd.read_excel(uploaded, sheet_name=None)  # todas las hojas
+        else:
+            tables = {"MRR": pd.read_csv(uploaded)}
+        st.session_state["unified_df"] = build_unified_long(tables)
+
+else:  # Google Sheets (público)
+    url_or_id = st.sidebar.text_input("URL o ID de Google Sheets")
+    sheet_list = st.sidebar.text_input("Nombres de hojas (coma)", value="MRR,CIHS,Transactions")
+    if url_or_id:
+        sheet_names = tuple([s.strip() for s in sheet_list.split(",") if s.strip()])
+        st.session_state["unified_df"] = load_from_public_sheets(url_or_id, sheet_names)
+
+unified = st.session_state.get("unified_df")
+if unified is None or unified.empty:
+    st.info("Carga un archivo o configura Google Sheets en la barra lateral.")
+    st.stop()
+
 
 st.title("📊 Instaleap — Revenue & Health Forecaster")
 st.caption("MRR · CIHS · Transacciones · Cohortes · País · Alertas de churn")
