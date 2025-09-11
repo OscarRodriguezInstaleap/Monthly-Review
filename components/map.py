@@ -1,14 +1,13 @@
-# --- components/map.py (reemplazo completo) ---
 import streamlit as st, pandas as pd, plotly.express as px
 from typing import Dict, List, Optional
 
-# Intenta usar clic en el mapa si está disponible
+# Clics en el mapa (si está instalada la lib)
 try:
     from streamlit_plotly_events import plotly_events
 except Exception:
     plotly_events = None
 
-# 1) Normalización básica de nombres de país (ajusta/añade si hace falta)
+# Normalización de nombres de país
 def normalize_country_name(name: str) -> str:
     if not isinstance(name, str): return ""
     s = name.strip()
@@ -35,12 +34,11 @@ def normalize_country_name(name: str) -> str:
         "nicaragua": "Nicaragua",
         "república dominicana": "Dominican Republic", "republica dominicana": "Dominican Republic",
         "puerto rico": "Puerto Rico",
-        # añade más si tus datos lo requieren
     }
     key = s.lower()
     return translations.get(key, s)
 
-# 2) Clusters / regiones (ajusta según tu negocio)
+# Clústeres / regiones
 country_to_cluster: Dict[str, str] = {
     # Sudamérica
     "Argentina":"Sudamérica","Bolivia":"Sudamérica","Brazil":"Sudamérica","Chile":"Sudamérica",
@@ -52,23 +50,26 @@ country_to_cluster: Dict[str, str] = {
     "El Salvador":"Centro/Caribe","Nicaragua":"Centro/Caribe","Dominican Republic":"Centro/Caribe","Puerto Rico":"Centro/Caribe",
     # Europa (ejemplos)
     "Spain":"Europa","United Kingdom":"Europa","Germany":"Europa","France":"Europa","Italy":"Europa",
-    # ... añade el resto si necesitas
 }
 
-def map_by_country(unified: pd.DataFrame):
+def map_by_country(
+    unified: pd.DataFrame,
+    make_forecast=None,  # opcional para compatibilidad
+    plot_series_with_forecast=None  # opcional para compatibilidad
+):
     st.subheader("Análisis por país (mapa interactivo)")
 
     if "pais" not in unified.columns or unified["pais"].dropna().empty:
         st.caption("No hay columna de país disponible en los datos."); return
 
-    # --- Filtros UI para Clúster ---
-    st.markdown("##### Opciones del mapa")
-    cluster_enabled = st.checkbox("Filtrar por clúster/region", value=True)
-    # Normaliza país y asocia clúster
+    # Normaliza país y clúster
     data = unified.copy()
     data["pais_norm"] = data["pais"].apply(normalize_country_name)
     data["cluster"] = data["pais_norm"].map(country_to_cluster).fillna("Otros")
 
+    # Filtro por clúster
+    st.markdown("##### Opciones del mapa")
+    cluster_enabled = st.checkbox("Filtrar por clúster/region", value=True)
     clusters = sorted(data["cluster"].dropna().unique().tolist())
     sel_clusters: List[str] = clusters
     if cluster_enabled:
@@ -76,7 +77,7 @@ def map_by_country(unified: pd.DataFrame):
         if sel_clusters:
             data = data[data["cluster"].isin(sel_clusters)]
 
-    # --- Tomamos MRR último periodo por país ---
+    # MRR último periodo por país
     m = data[data["metric"] == "MRR"].copy()
     if m.empty:
         st.caption("No hay datos de MRR para mapa con los filtros actuales."); return
@@ -85,17 +86,13 @@ def map_by_country(unified: pd.DataFrame):
     last_df = m[m["period"] == last_p]
     agg = (last_df.groupby(["pais_norm","cluster"], as_index=False)
            .agg(MRR=("value","sum"), clientes=("cliente","nunique")))
-
     if agg.empty:
         st.caption("No hay datos consolidados para el último periodo."); return
 
-    # Cálculo de variaciones MoM/YoY para hover
-    # (no afectan el color; solo enriquecen el tooltip)
+    # Hover con MoM/YoY
     def growths_for_country(df_country: pd.DataFrame):
         by_p = df_country.groupby("period", as_index=False)["value"].sum().sort_values("period")
-        # prev (mes anterior)
-        periods = by_p["period"].tolist()
-        if not periods: return None, None
+        if by_p.empty: return None, None
         last = by_p.iloc[-1]["value"]
         prev = by_p.iloc[-2]["value"] if len(by_p) >= 2 else None
         yoyp = str((pd.Period(by_p.iloc[-1]["period"]) - 12)) if len(by_p) else None
@@ -104,7 +101,6 @@ def map_by_country(unified: pd.DataFrame):
         yoyg = ((last - yoy)/yoy*100) if yoy and yoy>0 else None
         return mom, yoyg
 
-    # Prepara dataframe para choropleth + hover data
     hover_rows = []
     for pais in agg["pais_norm"].unique():
         mom, yoy = growths_for_country(m[m["pais_norm"]==pais])
@@ -114,7 +110,7 @@ def map_by_country(unified: pd.DataFrame):
         hover_rows.append(row)
     plot_df = pd.DataFrame(hover_rows)
 
-    # --- Choropleth ---
+    # Choropleth con buena visibilidad (tema claro/oscuro)
     fig = px.choropleth(
         plot_df,
         locations="pais_norm",
@@ -132,16 +128,14 @@ def map_by_country(unified: pd.DataFrame):
         scope="world",
         labels={"MRR":"MRR"}
     )
-
-    # Que se vea BIEN en tema claro/oscuro
     fig.update_geos(
         showcountries=True,
-        countrycolor="#555",  # bordes visibles en fondo claro
+        countrycolor="#555",
         showcoastlines=True,
         coastlinecolor="#666",
         showland=True,
-        landcolor="#E5ECF6",  # gris azulado claro
-        projection_type="equirectangular",  # estable, sin “globo”
+        landcolor="#E5ECF6",
+        projection_type="equirectangular",
         fitbounds="locations"
     )
     fig.update_layout(
@@ -151,13 +145,12 @@ def map_by_country(unified: pd.DataFrame):
         plot_bgcolor="rgba(0,0,0,0)",
         coloraxis_colorbar=dict(title="MRR")
     )
-    # Hover bien formateado
     fig.update_traces(
         hovertemplate="<b>%{location}</b><br>MRR: $%{z:,.0f}<br>Clientes: %{customdata[0]}<br>MoM: %{customdata[1]}%<br>YoY: %{customdata[2]}%<br>Cluster: %{customdata[3]}<extra></extra>",
         customdata=plot_df[["clientes","crec_mom_%","crec_yoy_%","cluster"]].values
     )
 
-    # CLIC (si lib disponible). Si no, selectbox.
+    # Clic (si la lib está instalada)
     clicked_country: Optional[str] = None
     if plotly_events is not None:
         selected = plotly_events(fig, click_event=True, select_event=False, hover_event=False,
@@ -170,12 +163,12 @@ def map_by_country(unified: pd.DataFrame):
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # Selector de respaldo o para filtrar explícitamente
+    # Selector de respaldo
     all_countries = plot_df["pais_norm"].sort_values().unique().tolist()
     sel_country = st.selectbox("País", options=all_countries,
                                index=(all_countries.index(clicked_country) if clicked_country in all_countries else 0))
 
-    # KPIs por país seleccionado
+    # KPIs y (si se pasó) gráfico de forecast por país
     country_mask = data["pais_norm"] == sel_country
     m_country = data[(data["metric"]=="MRR") & country_mask]
     if m_country.empty:
@@ -200,10 +193,16 @@ def map_by_country(unified: pd.DataFrame):
     c3.metric("MoM", f"{mom:,.1f}%" if mom is not None else "—")
     c4.metric("YoY", f"{yoy:,.1f}%" if yoy is not None else "—")
 
-    # Top cuentas del último periodo (solo MRR)
+    # Top cuentas último periodo
     last_clients = (m_country[m_country["period"]==last_p]
                     .groupby("cliente", as_index=False)["value"].sum()
                     .sort_values("value", ascending=False)
                     .rename(columns={"value":"MRR"}))
     st.write(f"**Cuentas activas ({len(last_clients)})**")
     st.dataframe(last_clients, use_container_width=True)
+
+    # Forecast por país (si pasaron funciones)
+    if make_forecast is not None and plot_series_with_forecast is not None:
+        hist_df, fcst_df = make_forecast(unified[country_mask], metric="MRR", horizon=6, aggregate_first=True, by=[])
+        st.plotly_chart(plot_series_with_forecast(hist_df, fcst_df, f"{sel_country} - MRR Histórico + Pronóstico"),
+                        use_container_width=True)
