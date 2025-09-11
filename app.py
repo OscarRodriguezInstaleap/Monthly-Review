@@ -51,13 +51,14 @@ if data_source == "Google Sheets (público)":
         except Exception as e:
             st.error(f"Ocurrió un error al leer Google Sheets: {e}")
             st.stop()
-    if st.sidebar.button("Refrescar datos", use_container_width=True):
-        try:
-            names = tuple([s.strip() for s in sheet_list.split(",") if s.strip()])
-            st.session_state["unified_df"] = load_from_public_sheets(url_or_id, names)
-        except Exception as e:
-            st.error(f"Ocurrió un error al leer Google Sheets: {e}")
-            st.stop()
+if st.sidebar.button("Refrescar datos", use_container_width=True):
+    try:
+        load_from_public_sheets.clear()  # <- limpia caché de esa función
+        names = tuple([s.strip() for s in sheet_list.split(",") if s.strip()])
+        st.session_state["unified_df"] = load_from_public_sheets(url_or_id, names)
+    except Exception as e:
+        st.error(f"Ocurrió un error al leer Google Sheets: {e}")
+        st.stop()
 else:
     uploaded = st.sidebar.file_uploader("Sube tu archivo (.csv o .xlsx)", type=["csv","xlsx","xls"])
     if uploaded is not None:
