@@ -1,0 +1,12 @@
+
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+[data-testid="stMetricValue"] { font-weight: 700; }
+[data-testid="stMetric"] {
+  background: rgba(255,255,255,0.04);
+  border-radius: 14px;
+  padding: 14px 16px;
+  border: 1px solid rgba(255,255,255,0.08);
+}
+h1, h2, h3 { letter-spacing: .2px; }
+.block-container { padding-top: 1.2rem; }
