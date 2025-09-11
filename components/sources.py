@@ -8,7 +8,7 @@ def _extract_sheet_id(url_or_id: str) -> str:
         return url_or_id.split("/d/")[1].split("/")[0]
     return url_or_id
 
-@st.cache_data(show_spinner=True)
+@st.cache_data(show_spinner=True, ttl=60)
 def load_from_public_sheets(url_or_id: str, sheet_names=("MRR", "CIHS", "Transactions")):
     sheet_id = _extract_sheet_id(url_or_id)
     base = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet="
