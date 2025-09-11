@@ -82,3 +82,61 @@ def build_unified_long(tables: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         out.drop(columns=[f"{col}_bf"], inplace=True)
     out["period"] = pd.PeriodIndex(out["period"]).astype(str)
     return out
+import re
+SPANISH_MONTH_MAP = {
+    "enero":"january","febrero":"february","marzo":"march","abril":"april","mayo":"may","junio":"june",
+    "julio":"july","agosto":"august","setiembre":"september","septiembre":"september",
+    "octubre":"october","noviembre":"november","diciembre":"december",
+    # abreviaturas comunes
+    "ene":"jan","abr":"apr","ago":"aug","sept":"sep","dic":"dec"
+}
+
+def _es_to_en_months(s: str) -> str:
+    t = str(s).strip().lower()
+    # reemplaza palabras completas para no tocar nombres de cliente
+    for es, en in SPANISH_MONTH_MAP.items():
+        t = re.sub(rf"\\b{re.escape(es)}\\b", en, t, flags=re.IGNORECASE)
+    return t
+
+def detect_meta_and_time(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    def is_time_header(col):
+        if isinstance(col, (pd.Timestamp, datetime)): return True
+        s = str(col).strip()
+        s_norm = _es_to_en_months(s)
+
+        month_regex = re.compile(
+            r"^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-_/ ]?\\d{2,4}$",
+            re.IGNORECASE
+        )
+        if month_regex.match(s_norm):
+            return True
+
+        for fmt in ("%b-%y","%b-%Y","%B-%y","%B-%Y","%Y-%m","%Y/%m","%m-%Y","%m/%Y"):
+            try:
+                pd.to_datetime(s_norm, format=fmt)
+                return True
+            except Exception:
+                pass
+        try:
+            pd.to_datetime(s_norm, errors="raise")
+            if s.lower() not in {"type","zona","nuevo","cliente","razon social","razón social","razon_social","pais","país","country"}:
+                return True
+        except Exception:
+            return False
+        return False
+
+    meta_cols, ts_cols = [], []
+    for c in df.columns:
+        (ts_cols if is_time_header(c) else meta_cols).append(c)
+    return meta_cols, ts_cols
+
+def to_long(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    ...
+    def _parse_date(x):
+        if isinstance(x, (pd.Timestamp, datetime)): return pd.to_datetime(x)
+        s = _es_to_en_months(str(x))
+        for fmt in ("%b-%y","%b-%Y","%B-%y","%B-%Y","%Y-%m","%Y/%m","%m-%Y","%m/%Y"):
+            try: return pd.to_datetime(s, format=fmt)
+            except Exception: pass
+        try: return pd.to_datetime(s)
+        except Exception: return pd.NaT
