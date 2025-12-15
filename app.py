@@ -368,13 +368,21 @@ with st.expander("Filtros (opcionales)", expanded=False):
 
 def apply_filters_ui(d: pd.DataFrame, z_sel, t_sel, c_sel) -> pd.DataFrame:
     f = d.copy()
+
+    # Zona: conservar también filas sin zona (NaN = valor vacío)
     if z_sel:
-        f = f[f["zona"].isin(z_sel)]
+        f = f[(f["zona"].isin(z_sel)) | (f["zona"].isna())]
+
+    # Tipo: conservar también filas sin tipo (NaN = valor vacío)
     if t_sel:
-        f = f[f["type"].isin(t_sel)]
+        f = f[(f["type"].isin(t_sel)) | (f["type"].isna())]
+
+    # Cliente: este sí debe filtrar estricto (porque Transactions sí tiene cliente)
     if c_sel:
         f = f[f["cliente"].isin(c_sel)]
+
     return f
+
 
 fdata = apply_filters_ui(data, z_sel, t_sel, c_sel)
 
