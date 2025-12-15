@@ -14,7 +14,7 @@ st.set_page_config(page_title="Instaleap — Forecast V2", layout="wide")
 SHEET_ID = os.environ.get("SHEET_ID", "1ACX9OWNB0vHs8EpxeHxgByuPjDP9VC0E3k9b61V-i1I")
 TX_GID = os.environ.get("TX_GID", "1584335131")  # gid (identificador numérico de la hoja) de Transactions
 DEFAULT_HORIZON = 12
-CACHE_TTL = 600  # TTL (tiempo de vida) del cache (memoria temporal) en segundos
+CACHE_TTL = 600  # TTL (tiempo de vida del cache) en segundos
 
 # ============================================================
 # URLs Google Sheets -> CSV
@@ -29,9 +29,18 @@ def gviz_csv_url_by_gid(sheet_id: str, gid: str) -> str:
 # ============================================================
 # Helpers limpieza y parsing
 # ============================================================
-MONTH_SHORT = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+MONTH_SHORT = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Ene|Abr|Ago|Dic|Set)"  # CAMBIO MÍNIMO
 MONTH_BASE_RE = re.compile(rf"^{MONTH_SHORT}-\d{{2}}$")
 MONTH_COL_RE = re.compile(rf"^{MONTH_SHORT}-\d{{2}}(?:\.\d+)?$")
+
+# CAMBIO MÍNIMO: mapeo de meses ES -> EN para poder parsear "Ene-25", etc.
+MONTH_ES_TO_EN = {
+    "Ene": "Jan",
+    "Abr": "Apr",
+    "Ago": "Aug",
+    "Dic": "Dec",
+    "Set": "Sep",  # a veces usan "Set" para septiembre
+}
 
 def ensure_datetime_naive(df: pd.DataFrame, col: str):
     """Convierte columna a datetime sin timezone (zona horaria)."""
@@ -65,12 +74,24 @@ def col_to_base_label(colname: str) -> str | None:
     - Jan-25, Jan-25.1, ...
     - ISO '2025-09' / '2025-09-01'
     - serial de hoja (número grande tipo 45000+) como fecha
+    - CAMBIO MÍNIMO: abreviaturas ES como Ene-25, Abr-25, Ago-25, Dic-25, Set-25
     """
     s = str(colname).strip()
     base = s.split(".")[0].strip()
 
+    # CAMBIO MÍNIMO: si viene "Ene-25" lo convertimos a "Jan-25" para parsear
+    if re.match(r"^[A-Za-z]{3}-\d{2}$", base):
+        mon = base[:3]
+        yy = base[4:]
+        if mon in MONTH_ES_TO_EN:
+            base = f"{MONTH_ES_TO_EN[mon]}-{yy}"
+
     # Caso 1: Jan-25
     if MONTH_BASE_RE.match(base):
+        # si aún quedara en ES (por seguridad), lo convertimos aquí también
+        mon = base[:3]
+        if mon in MONTH_ES_TO_EN:
+            base = f"{MONTH_ES_TO_EN[mon]}-{base[4:]}"
         return base
 
     # Caso 2: serial numérico (si está en rango razonable)
@@ -132,6 +153,10 @@ def normalize_wide_to_long(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
     Convierte hoja en ancho a long:
     Meta esperada (si existe): Country, type client, Nuevo, Zona, Cliente, Razon Social
     Meses: Jan-25, Feb-25... (con o sin .1, .2)
+
+    CAMBIO MÍNIMO:
+    - Si la hoja (ej: Transactions) no trae 'Cliente', el caller puede renombrar la primera columna a 'Cliente'
+      antes de llamar esta función.
     """
     meta = ["Country", "type client", "Nuevo", "Zona", "Cliente", "Razon Social"]
 
@@ -145,7 +170,7 @@ def normalize_wide_to_long(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
     rename_map = {src: base for src, base in zip(selected_cols, base_labels)}
     sub.rename(columns=rename_map, inplace=True)
 
-    # melt wide -> long
+    # melt wide -> long (melt = pasar de ancho a largo)
     long = sub.melt(
         id_vars=keep_meta,
         value_vars=base_labels,
@@ -157,7 +182,6 @@ def normalize_wide_to_long(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
     long.drop(columns=["value_raw"], inplace=True)
 
     # period/date
-    # period_label viene tipo "Sep-25"
     long["period"] = pd.to_datetime(long["period_label"], format="%b-%y", errors="coerce").dt.to_period("M").astype(str)
     long["date"] = pd.to_datetime(long["period"] + "-01", errors="coerce")
 
@@ -189,6 +213,11 @@ def load_all() -> pd.DataFrame:
 
     # Transactions por gid (más robusto)
     tx_raw = pd.read_csv(gviz_csv_url_by_gid(SHEET_ID, TX_GID))
+
+    # CAMBIO MÍNIMO (clave): tu hoja Transactions tiene en col A el nombre del cliente.
+    # Si no viene una columna llamada "Cliente", renombramos la primera columna a "Cliente".
+    if "Cliente" not in tx_raw.columns and len(tx_raw.columns) > 0:
+        tx_raw = tx_raw.rename(columns={tx_raw.columns[0]: "Cliente"})
 
     mrr_long = normalize_wide_to_long(mrr_raw, "MRR")
     tx_long = normalize_wide_to_long(tx_raw, "Transactions")
@@ -374,7 +403,7 @@ with tabs[0]:
         fig = plot_hist_fc(m_hist, m_fc, title=f"MRR (escenario: {scenario})", label_mode="extrema")
         st.plotly_chart(fig, use_container_width=True)
 
-        # merge seguro (date ya es datetime en ambos)
+        # merge seguro (merge = unión de tablas por llave)
         ensure_datetime_naive(m_fc, "date")
         merged = (m_hist.rename(columns={"value": "historico"})
                   .merge(m_fc, on="date", how="outer")
