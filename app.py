@@ -14,7 +14,7 @@ st.set_page_config(page_title="Instaleap — Forecast V2", layout="wide")
 SHEET_ID = os.environ.get("SHEET_ID", "1ACX9OWNB0vHs8EpxeHxgByuPjDP9VC0E3k9b61V-i1I")
 TX_GID = os.environ.get("TX_GID", "1584335131")  # gid (identificador numérico de la hoja) de Transactions
 DEFAULT_HORIZON = 12
-CACHE_TTL = 600  # TTL (tiempo de vida del cache) en segundos
+CACHE_TTL = 600  # TTL (tiempo de vida) del cache (memoria temporal) en segundos
 
 # ============================================================
 # URLs Google Sheets -> CSV
@@ -29,17 +29,16 @@ def gviz_csv_url_by_gid(sheet_id: str, gid: str) -> str:
 # ============================================================
 # Helpers limpieza y parsing
 # ============================================================
-MONTH_SHORT = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Ene|Abr|Ago|Dic|Set)"  # CAMBIO MÍNIMO
+MONTH_SHORT = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|Ene|Abr|Ago|Dic|Set)"
 MONTH_BASE_RE = re.compile(rf"^{MONTH_SHORT}-\d{{2}}$")
 MONTH_COL_RE = re.compile(rf"^{MONTH_SHORT}-\d{{2}}(?:\.\d+)?$")
 
-# CAMBIO MÍNIMO: mapeo de meses ES -> EN para poder parsear "Ene-25", etc.
 MONTH_ES_TO_EN = {
     "Ene": "Jan",
     "Abr": "Apr",
     "Ago": "Aug",
     "Dic": "Dec",
-    "Set": "Sep",  # a veces usan "Set" para septiembre
+    "Set": "Sep",
 }
 
 def ensure_datetime_naive(df: pd.DataFrame, col: str):
@@ -74,12 +73,12 @@ def col_to_base_label(colname: str) -> str | None:
     - Jan-25, Jan-25.1, ...
     - ISO '2025-09' / '2025-09-01'
     - serial de hoja (número grande tipo 45000+) como fecha
-    - CAMBIO MÍNIMO: abreviaturas ES como Ene-25, Abr-25, Ago-25, Dic-25, Set-25
+    - abreviaturas ES: Ene-25, Abr-25, Ago-25, Dic-25, Set-25
     """
     s = str(colname).strip()
     base = s.split(".")[0].strip()
 
-    # CAMBIO MÍNIMO: si viene "Ene-25" lo convertimos a "Jan-25" para parsear
+    # Convertir ES->EN si aplica
     if re.match(r"^[A-Za-z]{3}-\d{2}$", base):
         mon = base[:3]
         yy = base[4:]
@@ -88,7 +87,6 @@ def col_to_base_label(colname: str) -> str | None:
 
     # Caso 1: Jan-25
     if MONTH_BASE_RE.match(base):
-        # si aún quedara en ES (por seguridad), lo convertimos aquí también
         mon = base[:3]
         if mon in MONTH_ES_TO_EN:
             base = f"{MONTH_ES_TO_EN[mon]}-{base[4:]}"
@@ -97,7 +95,6 @@ def col_to_base_label(colname: str) -> str | None:
     # Caso 2: serial numérico (si está en rango razonable)
     if re.match(r"^\d+$", base):
         n = int(base)
-        # serial típico de Sheets/Excel para fechas modernas
         if 30000 <= n <= 70000:
             dt = pd.Timestamp("1899-12-30") + pd.to_timedelta(n, unit="D")
             return dt.strftime("%b-%y")
@@ -132,7 +129,6 @@ def pick_best_month_columns(df: pd.DataFrame) -> tuple[list[str], list[str]]:
         best = max(cols, key=lambda col: float(to_numeric_clean(df[col]).sum()))
         selected_map[base_label] = best
 
-    # ordenar cronológicamente
     base_labels = list(selected_map.keys())
     base_labels_sorted = sorted(base_labels, key=lambda b: pd.to_datetime(b, format="%b-%y"))
 
@@ -153,10 +149,6 @@ def normalize_wide_to_long(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
     Convierte hoja en ancho a long:
     Meta esperada (si existe): Country, type client, Nuevo, Zona, Cliente, Razon Social
     Meses: Jan-25, Feb-25... (con o sin .1, .2)
-
-    CAMBIO MÍNIMO:
-    - Si la hoja (ej: Transactions) no trae 'Cliente', el caller puede renombrar la primera columna a 'Cliente'
-      antes de llamar esta función.
     """
     meta = ["Country", "type client", "Nuevo", "Zona", "Cliente", "Razon Social"]
 
@@ -170,7 +162,6 @@ def normalize_wide_to_long(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
     rename_map = {src: base for src, base in zip(selected_cols, base_labels)}
     sub.rename(columns=rename_map, inplace=True)
 
-    # melt wide -> long (melt = pasar de ancho a largo)
     long = sub.melt(
         id_vars=keep_meta,
         value_vars=base_labels,
@@ -181,11 +172,9 @@ def normalize_wide_to_long(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
     long["value"] = to_numeric_clean(long["value_raw"])
     long.drop(columns=["value_raw"], inplace=True)
 
-    # period/date
     long["period"] = pd.to_datetime(long["period_label"], format="%b-%y", errors="coerce").dt.to_period("M").astype(str)
     long["date"] = pd.to_datetime(long["period"] + "-01", errors="coerce")
 
-    # renombrar metas
     ren = {
         "Country": "pais",
         "type client": "type",
@@ -214,8 +203,8 @@ def load_all() -> pd.DataFrame:
     # Transactions por gid (más robusto)
     tx_raw = pd.read_csv(gviz_csv_url_by_gid(SHEET_ID, TX_GID))
 
-    # CAMBIO MÍNIMO (clave): tu hoja Transactions tiene en col A el nombre del cliente.
-    # Si no viene una columna llamada "Cliente", renombramos la primera columna a "Cliente".
+    # Ajuste: tu Transactions tiene col A = nombre del cliente (match con MRR col F)
+    # Si no hay columna "Cliente", renombramos la primera columna como "Cliente"
     if "Cliente" not in tx_raw.columns and len(tx_raw.columns) > 0:
         tx_raw = tx_raw.rename(columns={tx_raw.columns[0]: "Cliente"})
 
@@ -235,9 +224,48 @@ def load_all() -> pd.DataFrame:
 # ============================================================
 # Forecast (Prophet)
 # ============================================================
+def fit_prophet_series(series_df: pd.DataFrame, horizon=12) -> pd.DataFrame:
+    """
+    series_df: columnas ['date','value']
+    retorna: ['date','yhat','yhat_lower','yhat_upper']
+    Nota: devuelve DF vacío con dtypes correctos para evitar errores en merge (unión de tablas).
+    """
+    s = series_df.dropna().copy()
+    ensure_datetime_naive(s, "date")
+    s = s.sort_values("date")
+
+    empty = pd.DataFrame({
+        "date": pd.to_datetime(pd.Series([], dtype="datetime64[ns]")),
+        "yhat": pd.Series(dtype="float64"),
+        "yhat_lower": pd.Series(dtype="float64"),
+        "yhat_upper": pd.Series(dtype="float64"),
+    })
+
+    if s.empty or s["value"].sum() == 0 or len(s) < 3:
+        return empty
+
+    m = Prophet(
+        interval_width=0.8,
+        yearly_seasonality=True,
+        weekly_seasonality=False,
+        daily_seasonality=False
+    )
+    m.fit(s.rename(columns={"date": "ds", "value": "y"}))
+    fut = m.make_future_dataframe(periods=horizon, freq="MS", include_history=False)
+    fc = m.predict(fut)
+
+    out = pd.DataFrame({
+        "date": pd.to_datetime(fc["ds"]).dt.tz_localize(None),
+        "yhat": fc["yhat"].astype(float),
+        "yhat_lower": fc["yhat_lower"].astype(float),
+        "yhat_upper": fc["yhat_upper"].astype(float),
+    })
+    ensure_datetime_naive(out, "date")
+    return out
+
 def fit_prophet_predict_dates(series_df: pd.DataFrame, future_dates: pd.DatetimeIndex) -> pd.DataFrame:
     """
-    Ajusta Prophet y predice exactamente sobre las fechas entregadas (future_dates).
+    Ajusta Prophet y predice exactamente sobre future_dates.
     Retorna: ['date','yhat','yhat_lower','yhat_upper']
     """
     s = series_df.dropna().copy()
@@ -274,28 +302,136 @@ def fit_prophet_predict_dates(series_df: pd.DataFrame, future_dates: pd.Datetime
     ensure_datetime_naive(out, "date")
     return out
 
+def apply_scenario(fc: pd.DataFrame, scenario: str) -> pd.DataFrame:
+    if fc.empty:
+        return fc
+    mult = 1.0
+    if scenario == "Pesimista (–10%)":
+        mult = 0.90
+    elif scenario == "Optimista (+10%)":
+        mult = 1.10
+    out = fc.copy()
+    out["yhat"] = out["yhat"] * mult
+    out["yhat_lower"] = out["yhat_lower"] * mult
+    out["yhat_upper"] = out["yhat_upper"] * mult
+    return out
+
+def plot_hist_fc(hist: pd.DataFrame, fc: pd.DataFrame, title: str, label_mode="extrema") -> go.Figure:
+    fig = go.Figure()
+    if not hist.empty:
+        fig.add_trace(go.Scatter(x=hist["date"], y=hist["value"], mode="lines", name="Histórico"))
+
+    if not fc.empty:
+        fig.add_trace(go.Scatter(
+            x=list(fc["date"]) + list(fc["date"][::-1]),
+            y=list(fc["yhat_upper"]) + list(fc["yhat_lower"][::-1]),
+            fill="toself",
+            name="Intervalo",
+            opacity=0.2,
+            line=dict(width=0),
+        ))
+
+        mode = "lines"
+        text = None
+
+        if label_mode in ("extrema", "all"):
+            y = fc["yhat"].to_numpy()
+            if label_mode == "all":
+                text = [f"{v:,.0f}" for v in y]
+                mode = "lines+markers+text"
+            else:
+                win = 2
+                y_s = pd.Series(y)
+                is_max = (y_s.rolling(win, center=True).max() == y_s).fillna(False).to_numpy()
+                is_min = (y_s.rolling(win, center=True).min() == y_s).fillna(False).to_numpy()
+                text = [f"{y[i]:,.0f}" if (is_max[i] or is_min[i]) else None for i in range(len(y))]
+                mode = "lines+markers+text"
+
+        fig.add_trace(go.Scatter(
+            x=fc["date"], y=fc["yhat"], mode=mode, name="Pronóstico",
+            text=text, textposition="top center"
+        ))
+
+    fig.update_layout(
+        title=title,
+        height=460,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis_title="",
+        yaxis_title="",
+    )
+    return fig
+
+# ============================================================
+# Per-account summaries
+# ============================================================
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
+def per_account_forecast(d: pd.DataFrame, metric: str, horizon: int, scenario: str) -> pd.DataFrame:
+    """
+    Calcula forecast por cuenta (por cliente).
+    Nota: Prophet por cliente puede ser pesado (costoso computacionalmente) si hay muchos clientes.
+    """
+    dm = d[d["metric"] == metric].copy()
+    if dm.empty:
+        return pd.DataFrame(columns=[
+            "cliente", "ultimo_periodo", "ultimo_valor", "forecast_proximo_mes", "forecast_12_meses", "riesgo_caida"
+        ])
+
+    last_per = dm["period"].max()
+    rows = []
+
+    for cli, sub in dm.groupby("cliente"):
+        s = sub.groupby("date", as_index=False)["value"].sum().sort_values("date")
+        ensure_datetime_naive(s, "date")
+
+        fc = fit_prophet_series(s, horizon=horizon)
+        fc = apply_scenario(fc, scenario)
+
+        last_val = float(sub.loc[sub["period"] == last_per, "value"].sum())
+        next_month = float(fc["yhat"].iloc[0]) if not fc.empty else np.nan
+        sum_h = float(fc["yhat"].sum()) if not fc.empty else np.nan
+
+        risk = False
+        if len(s) >= 4:
+            last_hist = float(s["value"].iloc[-1])
+            prev3 = float(s["value"].iloc[-4:-1].mean())
+            risk = (prev3 > 0 and (last_hist < 0.6 * prev3))
+
+        rows.append({
+            "cliente": cli,
+            "ultimo_periodo": last_per,
+            "ultimo_valor": round(last_val, 2),
+            "forecast_proximo_mes": round(next_month, 2) if pd.notna(next_month) else None,
+            "forecast_12_meses": round(sum_h, 2) if pd.notna(sum_h) else None,
+            "riesgo_caida": bool(risk),
+        })
+
+    out = pd.DataFrame(rows)
+    if "forecast_12_meses" in out.columns:
+        out = out.sort_values("forecast_12_meses", ascending=False, na_position="last")
+    return out
 
 @st.cache_data(show_spinner=False, ttl=CACHE_TTL)
 def per_account_forecast_matrix(d: pd.DataFrame, metric: str, horizon: int, scenario: str) -> pd.DataFrame:
     """
-    Tabla mensual por cuenta (matriz): Col A = cliente, Col B.. = meses del forecast.
-    Es responsive al escenario (se actualiza con scenario/horizon/filtros).
+    Tabla mensual por cuenta (matriz):
+    - Col A: cliente
+    - Col B..: meses del forecast (según horizon)
+    Responsive a scenario/horizon/filtros.
     """
     dm = d[d["metric"] == metric].copy()
     if dm.empty:
         return pd.DataFrame(columns=["cliente"])
 
-    # Definimos un calendario común para todas las cuentas (mismos meses para todos)
     ensure_datetime_naive(dm, "date")
     last_date = dm["date"].max()
     if pd.isna(last_date):
         return pd.DataFrame(columns=["cliente"])
 
-    last_month_start = pd.to_datetime(last_date).to_period("M").to_timestamp()  # inicio del mes
-    start_fc = last_month_start + pd.offsets.MonthBegin(1)  # siguiente mes
+    last_month_start = pd.to_datetime(last_date).to_period("M").to_timestamp()
+    start_fc = last_month_start + pd.offsets.MonthBegin(1)
     months = pd.date_range(start_fc, periods=int(horizon), freq="MS")
 
-    month_cols = [m.strftime("%Y-%m") for m in months]  # headers claros
+    month_cols = [m.strftime("%Y-%m") for m in months]
     rows = []
 
     for cli, sub in dm.groupby("cliente"):
@@ -320,73 +456,11 @@ def per_account_forecast_matrix(d: pd.DataFrame, metric: str, horizon: int, scen
 
     out = pd.DataFrame(rows)
 
-    # Orden útil: mayor forecast total al inicio
     if month_cols:
         out["_sum"] = out[month_cols].sum(axis=1, numeric_only=True)
         out = out.sort_values("_sum", ascending=False, na_position="last").drop(columns=["_sum"])
 
     return out
-
-def apply_scenario(fc: pd.DataFrame, scenario: str) -> pd.DataFrame:
-    if fc.empty:
-        return fc
-    mult = 1.0
-    if scenario == "Pesimista (–10%)":
-        mult = 0.90
-    elif scenario == "Optimista (+10%)":
-        mult = 1.10
-    out = fc.copy()
-    out["yhat"] = out["yhat"] * mult
-    out["yhat_lower"] = out["yhat_lower"] * mult
-    out["yhat_upper"] = out["yhat_upper"] * mult
-    return out
-
-def plot_hist_fc(hist: pd.DataFrame, fc: pd.DataFrame, title: str, label_mode="extrema") -> go.Figure:
-    fig = go.Figure()
-    if not hist.empty:
-        fig.add_trace(go.Scatter(x=hist["date"], y=hist["value"], mode="lines", name="Histórico"))
-
-    if not fc.empty:
-        # intervalo
-        fig.add_trace(go.Scatter(
-            x=list(fc["date"]) + list(fc["date"][::-1]),
-            y=list(fc["yhat_upper"]) + list(fc["yhat_lower"][::-1]),
-            fill="toself",
-            name="Intervalo",
-            opacity=0.2,
-            line=dict(width=0),
-        ))
-
-        mode = "lines"
-        text = None
-
-        if label_mode in ("extrema", "all"):
-            y = fc["yhat"].to_numpy()
-            if label_mode == "all":
-                text = [f"{v:,.0f}" for v in y]
-                mode = "lines+markers+text"
-            else:
-                # picos y valles simples
-                win = 2
-                y_s = pd.Series(y)
-                is_max = (y_s.rolling(win, center=True).max() == y_s).fillna(False).to_numpy()
-                is_min = (y_s.rolling(win, center=True).min() == y_s).fillna(False).to_numpy()
-                text = [f"{y[i]:,.0f}" if (is_max[i] or is_min[i]) else None for i in range(len(y))]
-                mode = "lines+markers+text"
-
-        fig.add_trace(go.Scatter(
-            x=fc["date"], y=fc["yhat"], mode=mode, name="Pronóstico",
-            text=text, textposition="top center"
-        ))
-
-    fig.update_layout(
-        title=title,
-        height=460,
-        margin=dict(l=10, r=10, t=40, b=10),
-        xaxis_title="",
-        yaxis_title="",
-    )
-    return fig
 
 # ============================================================
 # UI
@@ -420,22 +494,22 @@ with st.expander("Filtros (opcionales)", expanded=False):
     c_sel = st.multiselect("Clientes (opcional)", clientes, default=[])
 
 def apply_filters_ui(d: pd.DataFrame, z_sel, t_sel, c_sel) -> pd.DataFrame:
+    """
+    Ajuste clave: si una fila no tiene zona/tipo (NaN), NO debe descartarse,
+    para que Transactions no desaparezca al filtrar por Zona/Tipo.
+    """
     f = d.copy()
 
-    # Zona: conservar también filas sin zona (NaN = valor vacío)
     if z_sel:
         f = f[(f["zona"].isin(z_sel)) | (f["zona"].isna())]
 
-    # Tipo: conservar también filas sin tipo (NaN = valor vacío)
     if t_sel:
         f = f[(f["type"].isin(t_sel)) | (f["type"].isna())]
 
-    # Cliente: este sí debe filtrar estricto (porque Transactions sí tiene cliente)
     if c_sel:
         f = f[f["cliente"].isin(c_sel)]
 
     return f
-
 
 fdata = apply_filters_ui(data, z_sel, t_sel, c_sel)
 
@@ -464,7 +538,6 @@ with tabs[0]:
         fig = plot_hist_fc(m_hist, m_fc, title=f"MRR (escenario: {scenario})", label_mode="extrema")
         st.plotly_chart(fig, use_container_width=True)
 
-        # merge seguro (merge = unión de tablas por llave)
         ensure_datetime_naive(m_fc, "date")
         merged = (m_hist.rename(columns={"value": "historico"})
                   .merge(m_fc, on="date", how="outer")
@@ -523,54 +596,6 @@ with tabs[1]:
 # ============================================================
 # Tab 3: Resumen por cuenta
 # ============================================================
-@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
-def per_account_forecast(d: pd.DataFrame, metric: str, horizon: int, scenario: str) -> pd.DataFrame:
-    """
-    Calcula forecast por cuenta (por cliente).
-    Nota: Prophet por cliente puede ser pesado (costoso computacionalmente) si hay muchos clientes.
-    """
-    dm = d[d["metric"] == metric].copy()
-    if dm.empty:
-        return pd.DataFrame(columns=[
-            "cliente", "ultimo_periodo", "ultimo_valor", "forecast_proximo_mes", "forecast_12_meses", "riesgo_caida"
-        ])
-
-    last_per = dm["period"].max()
-    rows = []
-
-    for cli, sub in dm.groupby("cliente"):
-        s = sub.groupby("date", as_index=False)["value"].sum().sort_values("date")
-        ensure_datetime_naive(s, "date")
-
-        fc = fit_prophet_series(s, horizon=horizon)
-        fc = apply_scenario(fc, scenario)
-
-        last_val = float(sub.loc[sub["period"] == last_per, "value"].sum())
-        next_month = float(fc["yhat"].iloc[0]) if not fc.empty else np.nan
-        sum_h = float(fc["yhat"].sum()) if not fc.empty else np.nan
-
-        # regla simple de riesgo: último mes < 60% del promedio de los 3 previos
-        risk = False
-        if len(s) >= 4:
-            last_hist = float(s["value"].iloc[-1])
-            prev3 = float(s["value"].iloc[-4:-1].mean())
-            risk = (prev3 > 0 and (last_hist < 0.6 * prev3))
-
-        rows.append({
-            "cliente": cli,
-            "ultimo_periodo": last_per,
-            "ultimo_valor": round(last_val, 2),
-            "forecast_proximo_mes": round(next_month, 2) if pd.notna(next_month) else None,
-            "forecast_12_meses": round(sum_h, 2) if pd.notna(sum_h) else None,
-            "riesgo_caida": bool(risk),
-        })
-
-    out = pd.DataFrame(rows)
-    # ordenar por forecast
-    if "forecast_12_meses" in out.columns:
-        out = out.sort_values("forecast_12_meses", ascending=False, na_position="last")
-    return out
-
 with tabs[2]:
     st.subheader("Resumen por cuenta — Forecast")
 
@@ -590,6 +615,18 @@ with tabs[2]:
             mime="text/csv",
         )
 
+        st.markdown("#### Forecast mensual por cuenta (MRR)")
+        show_mrr_matrix = st.checkbox("Mostrar tabla mensual (MRR)", value=False, key="mx_mrr")
+        if show_mrr_matrix:
+            mrr_matrix = per_account_forecast_matrix(fdata, "MRR", horizon_tbl, scenario_tbl)
+            st.dataframe(mrr_matrix, use_container_width=True, height=420)
+            st.download_button(
+                "Descargar CSV Forecast mensual (MRR)",
+                mrr_matrix.to_csv(index=False).encode("utf-8"),
+                file_name="mrr_forecast_mensual_por_cuenta.csv",
+                mime="text/csv",
+            )
+
     with col2:
         st.markdown("### Transactions — por cuenta")
         tx_acc = per_account_forecast(fdata, "Transactions", horizon_tbl, scenario_tbl)
@@ -600,6 +637,18 @@ with tabs[2]:
             file_name="transactions_por_cuenta.csv",
             mime="text/csv",
         )
+
+        st.markdown("#### Forecast mensual por cuenta (Transactions)")
+        show_tx_matrix = st.checkbox("Mostrar tabla mensual (Transactions)", value=False, key="mx_tx")
+        if show_tx_matrix:
+            tx_matrix = per_account_forecast_matrix(fdata, "Transactions", horizon_tbl, scenario_tbl)
+            st.dataframe(tx_matrix, use_container_width=True, height=420)
+            st.download_button(
+                "Descargar CSV Forecast mensual (Transactions)",
+                tx_matrix.to_csv(index=False).encode("utf-8"),
+                file_name="transactions_forecast_mensual_por_cuenta.csv",
+                mime="text/csv",
+            )
 
 with st.expander("Debug general (últimos periodos detectados)"):
     for met in ["MRR", "Transactions"]:
