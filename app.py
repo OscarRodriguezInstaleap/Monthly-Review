@@ -1,177 +1,249 @@
 import os
 import re
-import time
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 from prophet import Prophet
 
-# =========================
+# ============================================================
 # Config
-# =========================
+# ============================================================
 st.set_page_config(page_title="Instaleap — Forecast V2", layout="wide")
+
 SHEET_ID = os.environ.get("SHEET_ID", "1ACX9OWNB0vHs8EpxeHxgByuPjDP9VC0E3k9b61V-i1I")
-SHEETS = ("MRR", "Transactions")
+TX_GID = os.environ.get("TX_GID", "1584335131")  # gid (identificador numérico de la hoja) de Transactions
 DEFAULT_HORIZON = 12
+CACHE_TTL = 600  # TTL (tiempo de vida) del cache (memoria temporal) en segundos
 
-# =========================
-# Helpers de datos
-# =========================
-MONTH_RE = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2}(?:\.\d+)?$')
-
-def gviz_csv_url(sheet_id: str, sheet_name: str) -> str:
+# ============================================================
+# URLs Google Sheets -> CSV
+# ============================================================
+def gviz_csv_url_by_sheet(sheet_id: str, sheet_name: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+
+def gviz_csv_url_by_gid(sheet_id: str, gid: str) -> str:
+    # Export directo por gid (más robusto cuando el nombre de hoja no coincide)
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+# ============================================================
+# Helpers limpieza y parsing
+# ============================================================
+MONTH_SHORT = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+MONTH_BASE_RE = re.compile(rf"^{MONTH_SHORT}-\d{{2}}$")
+MONTH_COL_RE = re.compile(rf"^{MONTH_SHORT}-\d{{2}}(?:\.\d+)?$")
+
+def ensure_datetime_naive(df: pd.DataFrame, col: str):
+    """Convierte columna a datetime sin timezone (zona horaria)."""
+    if col not in df.columns:
+        return
+    df[col] = pd.to_datetime(df[col], errors="coerce")
+    try:
+        df[col] = df[col].dt.tz_localize(None)
+    except Exception:
+        pass
 
 def to_numeric_clean(s: pd.Series) -> pd.Series:
     """Convierte strings con $ , . y formatos ES/EN a float seguro."""
     s = s.astype(str).str.strip()
-    s = s.replace({'': '0', 'nan': '0', 'None':'0'})
-    s = s.str.replace(r'[\$\s]', '', regex=True)
-    # Formato español: 12.345,67  o 12.345
-    es_mask = s.str.match(r'^\d{1,3}(?:\.\d{3})+(?:,\d+)?$')
-    s.loc[es_mask] = s.loc[es_mask].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-    # Formato EN miles: 12,345.67 -> quitar comas
-    s = s.str.replace(',', '', regex=False)
-    return pd.to_numeric(s, errors='coerce').fillna(0.0)
+    s = s.replace({"": "0", "nan": "0", "None": "0"})
+    s = s.str.replace(r"[\$\s]", "", regex=True)
 
-def pick_best_month_columns(df: pd.DataFrame):
-    """Cuando hay duplicados (Jan-25, Jan-25.1, ...), elige para cada base la columna de mayor suma."""
-    month_cols = [c for c in df.columns if MONTH_RE.match(str(c))]
-    groups = {}
-    for c in month_cols:
-        base = c.split('.')[0]
-        groups.setdefault(base, []).append(c)
+    # Formato español: 12.345,67 o 12.345
+    es_mask = s.str.match(r"^\d{1,3}(?:\.\d{3})+(?:,\d+)?$")
+    s.loc[es_mask] = s.loc[es_mask].str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
 
-    selected = {}
-    for base, cols in groups.items():
-        best = max(cols, key=lambda col: to_numeric_clean(df[col]).sum())
-        selected[base] = best
+    # Formato EN con miles: 12,345.67 -> quitar comas
+    s = s.str.replace(",", "", regex=False)
 
-    order = sorted(selected.keys(), key=lambda b: pd.to_datetime(b, format='%b-%y'))
-    return [selected[b] for b in order], order
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+def col_to_base_label(colname: str) -> str | None:
+    """
+    Normaliza un encabezado de columna a 'Mon-YY' (ej: 'Sep-25').
+    Soporta:
+    - Jan-25, Jan-25.1, ...
+    - ISO '2025-09' / '2025-09-01'
+    - serial de hoja (número grande tipo 45000+) como fecha
+    """
+    s = str(colname).strip()
+    base = s.split(".")[0].strip()
+
+    # Caso 1: Jan-25
+    if MONTH_BASE_RE.match(base):
+        return base
+
+    # Caso 2: serial numérico (si está en rango razonable)
+    if re.match(r"^\d+$", base):
+        n = int(base)
+        # serial típico de Sheets/Excel para fechas modernas
+        if 30000 <= n <= 70000:
+            dt = pd.Timestamp("1899-12-30") + pd.to_timedelta(n, unit="D")
+            return dt.strftime("%b-%y")
+        return None
+
+    # Caso 3: ISO fecha
+    try:
+        dt = pd.to_datetime(base, errors="raise")
+        return dt.strftime("%b-%y")
+    except Exception:
+        return None
+
+def pick_best_month_columns(df: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """
+    Cuando hay duplicados por mes (ej: Jan-25, Jan-25.1, ...),
+    elige por cada mes base la columna con mayor suma numérica.
+    Retorna: (selected_cols, base_labels_ordered)
+    """
+    groups: dict[str, list[str]] = {}
+
+    for c in df.columns:
+        base_label = col_to_base_label(c)
+        if base_label is None:
+            continue
+        groups.setdefault(base_label, []).append(c)
+
+    if not groups:
+        return [], []
+
+    selected_map: dict[str, str] = {}
+    for base_label, cols in groups.items():
+        best = max(cols, key=lambda col: float(to_numeric_clean(df[col]).sum()))
+        selected_map[base_label] = best
+
+    # ordenar cronológicamente
+    base_labels = list(selected_map.keys())
+    base_labels_sorted = sorted(base_labels, key=lambda b: pd.to_datetime(b, format="%b-%y"))
+
+    selected_cols_sorted = [selected_map[b] for b in base_labels_sorted]
+    return selected_cols_sorted, base_labels_sorted
 
 def trim_trailing_zero_months(long_df: pd.DataFrame) -> pd.DataFrame:
     """Recorta meses finales con puro 0 para evitar meses fantasma."""
-    sums = long_df.groupby('period', as_index=False)['value'].sum().sort_values('period')
-    nz = sums[sums['value'] != 0]
+    sums = long_df.groupby("period", as_index=False)["value"].sum().sort_values("period")
+    nz = sums[sums["value"] != 0]
     if not nz.empty:
-        last = nz['period'].max()
-        return long_df[long_df['period'] <= last]
+        last = nz["period"].max()
+        return long_df[long_df["period"] <= last]
     return long_df
 
 def normalize_wide_to_long(df: pd.DataFrame, metric_name: str) -> pd.DataFrame:
     """
-    Convierte una hoja en ancho a long:
-    columnas meta esperadas (si existen): Country, type client, Nuevo, Zona, Cliente, Razon Social
-    columnas de meses: Jan-25, Feb-25, ... (con o sin .1, .2, ...)
+    Convierte hoja en ancho a long:
+    Meta esperada (si existe): Country, type client, Nuevo, Zona, Cliente, Razon Social
+    Meses: Jan-25, Feb-25... (con o sin .1, .2)
     """
-    meta = ['Country','type client','Nuevo','Zona','Cliente','Razon Social']
-    # Selección robusta de meses
-    selected_cols, base_order = pick_best_month_columns(df)
-    keep = [c for c in meta if c in df.columns] + selected_cols
+    meta = ["Country", "type client", "Nuevo", "Zona", "Cliente", "Razon Social"]
+
+    selected_cols, base_labels = pick_best_month_columns(df)
+
+    keep_meta = [c for c in meta if c in df.columns]
+    keep = keep_meta + selected_cols
     sub = df[keep].copy()
 
-    # Renombra a base sin sufijos .1, .2
-    rename_map = dict(zip(selected_cols, base_order))
+    # renombrar selected cols a base label (Jan-25.2 -> Jan-25)
+    rename_map = {src: base for src, base in zip(selected_cols, base_labels)}
     sub.rename(columns=rename_map, inplace=True)
 
-    # wide -> long
+    # melt wide -> long
     long = sub.melt(
-        id_vars=[c for c in meta if c in sub.columns],
-        value_vars=base_order,
-        var_name='period_label',
-        value_name='value_raw'
+        id_vars=keep_meta,
+        value_vars=base_labels,
+        var_name="period_label",
+        value_name="value_raw",
     )
 
-    # numérico robusto
-    long['value'] = to_numeric_clean(long['value_raw'])
-    long.drop(columns=['value_raw'], inplace=True)
+    long["value"] = to_numeric_clean(long["value_raw"])
+    long.drop(columns=["value_raw"], inplace=True)
 
-    # period YYYY-MM y date primer día del mes
-    long['period'] = pd.to_datetime(long['period_label'], format='%b-%y').dt.to_period('M').astype(str)
-    long['date'] = pd.to_datetime(long['period'] + '-01')
+    # period/date
+    # period_label viene tipo "Sep-25"
+    long["period"] = pd.to_datetime(long["period_label"], format="%b-%y", errors="coerce").dt.to_period("M").astype(str)
+    long["date"] = pd.to_datetime(long["period"] + "-01", errors="coerce")
 
-    # normaliza meta
-    ren = {'Country':'pais','type client':'type','Razon Social':'razon_social',
-           'Cliente':'cliente','Zona':'zona','Nuevo':'nuevo'}
-    long.rename(columns={k:v for k,v in ren.items() if k in long.columns}, inplace=True)
+    # renombrar metas
+    ren = {
+        "Country": "pais",
+        "type client": "type",
+        "Razon Social": "razon_social",
+        "Cliente": "cliente",
+        "Zona": "zona",
+        "Nuevo": "nuevo",
+    }
+    long.rename(columns={k: v for k, v in ren.items() if k in long.columns}, inplace=True)
 
-    long['metric'] = metric_name
+    long["metric"] = metric_name
+    ensure_datetime_naive(long, "date")
+
     long = trim_trailing_zero_months(long)
+
     return long
 
-@st.cache_data(show_spinner=False, ttl=600)
+# ============================================================
+# Carga (con cache)
+# ============================================================
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
 def load_all() -> pd.DataFrame:
-    tables = {}
-    for s in SHEETS:
-        url = gviz_csv_url(SHEET_ID, s)
-        tables[s] = pd.read_csv(url)
-    mrr_long = normalize_wide_to_long(tables["MRR"], "MRR")
-    tx_long  = normalize_wide_to_long(tables["Transactions"], "Transactions")
+    # MRR por nombre de hoja
+    mrr_raw = pd.read_csv(gviz_csv_url_by_sheet(SHEET_ID, "MRR"))
+
+    # Transactions por gid (más robusto)
+    tx_raw = pd.read_csv(gviz_csv_url_by_gid(SHEET_ID, TX_GID))
+
+    mrr_long = normalize_wide_to_long(mrr_raw, "MRR")
+    tx_long = normalize_wide_to_long(tx_raw, "Transactions")
+
     unified = pd.concat([mrr_long, tx_long], ignore_index=True)
-    # columnas mínimas homogéneas
-    for col in ["pais","type","zona","cliente","razon_social","period","date","value","metric"]:
+
+    # columnas mínimas
+    for col in ["pais", "type", "zona", "cliente", "razon_social", "period", "date", "value", "metric"]:
         if col not in unified.columns:
             unified[col] = np.nan
+
+    ensure_datetime_naive(unified, "date")
     return unified
 
-# =========================
-# Forecast
-# =========================
+# ============================================================
+# Forecast (Prophet)
+# ============================================================
 def fit_prophet_series(series_df: pd.DataFrame, horizon=12) -> pd.DataFrame:
     """
     series_df: columnas ['date','value']
-    retorna dataframe con ['date','yhat','yhat_lower','yhat_upper']
+    retorna: ['date','yhat','yhat_lower','yhat_upper']
+    Nota: devuelve DF vacío con dtypes correctos para evitar errores en merge (unión de tablas).
     """
     s = series_df.dropna().copy()
+    ensure_datetime_naive(s, "date")
     s = s.sort_values("date")
-    if s["value"].sum() == 0 or len(s) < 3:
-        # Series sin información suficiente; devolvemos vacío
-        return pd.DataFrame(columns=["date","yhat","yhat_lower","yhat_upper"])
 
-    m = Prophet(interval_width=0.8, yearly_seasonality=True, weekly_seasonality=False, daily_seasonality=False)
-    m.fit(s.rename(columns={"date":"ds","value":"y"}))
+    empty = pd.DataFrame({
+        "date": pd.to_datetime(pd.Series([], dtype="datetime64[ns]")),
+        "yhat": pd.Series(dtype="float64"),
+        "yhat_lower": pd.Series(dtype="float64"),
+        "yhat_upper": pd.Series(dtype="float64"),
+    })
+
+    if s.empty or s["value"].sum() == 0 or len(s) < 3:
+        return empty
+
+    m = Prophet(
+        interval_width=0.8,
+        yearly_seasonality=True,
+        weekly_seasonality=False,
+        daily_seasonality=False
+    )
+    m.fit(s.rename(columns={"date": "ds", "value": "y"}))
     fut = m.make_future_dataframe(periods=horizon, freq="MS", include_history=False)
     fc = m.predict(fut)
-    out = pd.DataFrame({
-        "date": pd.to_datetime(fc["ds"]),
-        "yhat": fc["yhat"],
-        "yhat_lower": fc["yhat_lower"],
-        "yhat_upper": fc["yhat_upper"]
-    })
-    return out
 
-def plot_hist_fc(hist: pd.DataFrame, fc: pd.DataFrame, title: str, label_mode="extrema"):
-    fig = go.Figure()
-    if not hist.empty:
-        fig.add_trace(go.Scatter(x=hist["date"], y=hist["value"], mode="lines", name="Histórico"))
-    if not fc.empty:
-        # banda
-        fig.add_trace(go.Scatter(
-            x=list(fc["date"])+list(fc["date"][::-1]),
-            y=list(fc["yhat_upper"])+list(fc["yhat_lower"][::-1]),
-            fill="toself", name="Intervalo", opacity=0.2, line=dict(width=0)
-        ))
-        # línea forecast
-        mode = "lines"
-        text = None
-        if label_mode in ("extrema","all"):
-            y = fc["yhat"].to_numpy()
-            if label_mode == "all":
-                text = [f"{v:,.0f}" for v in y]
-                mode = "lines+markers+text"
-            else:
-                # marcar picos y valles
-                win = 2
-                is_max = (pd.Series(y).rolling(win, center=True).max() == pd.Series(y)).fillna(False).to_numpy()
-                is_min = (pd.Series(y).rolling(win, center=True).min() == pd.Series(y)).fillna(False).to_numpy()
-                text = [f"{y[i]:,.0f}" if (is_max[i] or is_min[i]) else None for i in range(len(y))]
-                mode = "lines+markers+text"
-        fig.add_trace(go.Scatter(x=fc["date"], y=fc["yhat"], mode=mode, name="Pronóstico", text=text, textposition="top center"))
-    fig.update_layout(title=title, height=460, margin=dict(l=10,r=10,t=40,b=10), xaxis_title="", yaxis_title="")
-    return fig
+    out = pd.DataFrame({
+        "date": pd.to_datetime(fc["ds"]).dt.tz_localize(None),
+        "yhat": fc["yhat"].astype(float),
+        "yhat_lower": fc["yhat_lower"].astype(float),
+        "yhat_upper": fc["yhat_upper"].astype(float),
+    })
+    ensure_datetime_naive(out, "date")
+    return out
 
 def apply_scenario(fc: pd.DataFrame, scenario: str) -> pd.DataFrame:
     if fc.empty:
@@ -187,21 +259,76 @@ def apply_scenario(fc: pd.DataFrame, scenario: str) -> pd.DataFrame:
     out["yhat_upper"] = out["yhat_upper"] * mult
     return out
 
-# =========================
+def plot_hist_fc(hist: pd.DataFrame, fc: pd.DataFrame, title: str, label_mode="extrema") -> go.Figure:
+    fig = go.Figure()
+    if not hist.empty:
+        fig.add_trace(go.Scatter(x=hist["date"], y=hist["value"], mode="lines", name="Histórico"))
+
+    if not fc.empty:
+        # intervalo
+        fig.add_trace(go.Scatter(
+            x=list(fc["date"]) + list(fc["date"][::-1]),
+            y=list(fc["yhat_upper"]) + list(fc["yhat_lower"][::-1]),
+            fill="toself",
+            name="Intervalo",
+            opacity=0.2,
+            line=dict(width=0),
+        ))
+
+        mode = "lines"
+        text = None
+
+        if label_mode in ("extrema", "all"):
+            y = fc["yhat"].to_numpy()
+            if label_mode == "all":
+                text = [f"{v:,.0f}" for v in y]
+                mode = "lines+markers+text"
+            else:
+                # picos y valles simples
+                win = 2
+                y_s = pd.Series(y)
+                is_max = (y_s.rolling(win, center=True).max() == y_s).fillna(False).to_numpy()
+                is_min = (y_s.rolling(win, center=True).min() == y_s).fillna(False).to_numpy()
+                text = [f"{y[i]:,.0f}" if (is_max[i] or is_min[i]) else None for i in range(len(y))]
+                mode = "lines+markers+text"
+
+        fig.add_trace(go.Scatter(
+            x=fc["date"], y=fc["yhat"], mode=mode, name="Pronóstico",
+            text=text, textposition="top center"
+        ))
+
+    fig.update_layout(
+        title=title,
+        height=460,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis_title="",
+        yaxis_title="",
+    )
+    return fig
+
+# ============================================================
 # UI
-# =========================
+# ============================================================
 st.title("Instaleap — Forecast V2 (MRR & Transacciones)")
+
 with st.sidebar:
     st.markdown("### Fuente de datos")
-    st.write(f"Google Sheet ID: `{SHEET_ID}`")
-    if st.button("Refrescar datos"):
-        load_all.clear()  # limpia cache
-        st.success("Datos recargados.")
+    st.write(f"Sheet ID: `{SHEET_ID}`")
+    st.write(f"Transactions gid: `{TX_GID}`")
+    if st.button("Refrescar datos (cache)"):
+        load_all.clear()
+        st.success("Cache limpiado. Vuelve a cargar la página o cambia de tab.")
 
 data = load_all()
 
-# Filtros simples (opcionales)
-with st.expander("Filtros", expanded=False):
+# Health check rápido
+vc = data["metric"].value_counts().to_dict()
+colA, colB, colC = st.columns(3)
+colA.metric("Filas MRR", int(vc.get("MRR", 0)))
+colB.metric("Filas Transactions", int(vc.get("Transactions", 0)))
+colC.metric("Total filas", int(len(data)))
+
+with st.expander("Filtros (opcionales)", expanded=False):
     zonas = sorted([z for z in data["zona"].dropna().unique().tolist()])
     tipos = sorted([t for t in data["type"].dropna().unique().tolist()])
     clientes = sorted([c for c in data["cliente"].dropna().unique().tolist()])
@@ -210,7 +337,7 @@ with st.expander("Filtros", expanded=False):
     t_sel = st.multiselect("Tipo", tipos, default=tipos)
     c_sel = st.multiselect("Clientes (opcional)", clientes, default=[])
 
-def apply_filters(d: pd.DataFrame, z_sel, t_sel, c_sel):
+def apply_filters_ui(d: pd.DataFrame, z_sel, t_sel, c_sel) -> pd.DataFrame:
     f = d.copy()
     if z_sel:
         f = f[f["zona"].isin(z_sel)]
@@ -220,113 +347,174 @@ def apply_filters(d: pd.DataFrame, z_sel, t_sel, c_sel):
         f = f[f["cliente"].isin(c_sel)]
     return f
 
-fdata = apply_filters(data, z_sel if 'z_sel' in locals() else None,
-                      t_sel if 't_sel' in locals() else None,
-                      c_sel if 'c_sel' in locals() else None)
+fdata = apply_filters_ui(data, z_sel, t_sel, c_sel)
 
-tabs = st.tabs(["MRR (hist + forecast)", "Transacciones (hist + forecast)", "Resumen por cuenta"])
+tabs = st.tabs(["MRR (hist + forecast)", "Transactions (hist + forecast)", "Resumen por cuenta"])
 
-# =========================
+# ============================================================
 # Tab 1: MRR
-# =========================
+# ============================================================
 with tabs[0]:
-    st.subheader("MRR — Histórico + Pronóstico (12 meses)")
-    scenario = st.selectbox("Escenario", ["Base", "Pesimista (–10%)", "Optimista (+10%)"], index=0)
-    horizon = st.slider("Horizonte (meses)", 3, 18, DEFAULT_HORIZON, 1)
+    st.subheader("MRR — Histórico + Pronóstico")
 
-    m_hist = (fdata[fdata["metric"]=="MRR"]
+    scenario = st.selectbox("Escenario", ["Base", "Pesimista (–10%)", "Optimista (+10%)"], index=0, key="sc_mrr")
+    horizon = st.slider("Horizonte (meses)", 3, 18, DEFAULT_HORIZON, 1, key="hz_mrr")
+
+    m_hist = (fdata[fdata["metric"] == "MRR"]
               .groupby("date", as_index=False)["value"].sum()
               .sort_values("date"))
-    m_fc = fit_prophet_series(m_hist, horizon=horizon)
-    m_fc = apply_scenario(m_fc, scenario)
+    ensure_datetime_naive(m_hist, "date")
 
-    fig = plot_hist_fc(m_hist, m_fc, title=f"MRR (escenario: {scenario})", label_mode="extrema")
-    st.plotly_chart(fig, use_container_width=True)
+    if m_hist.empty:
+        st.warning("No hay datos de MRR con los filtros actuales.")
+    else:
+        m_fc = fit_prophet_series(m_hist, horizon=horizon)
+        m_fc = apply_scenario(m_fc, scenario)
 
-    # Tabla exportable
-    merged = m_hist.rename(columns={"value":"historico"}).merge(m_fc, on="date", how="outer").sort_values("date")
-    merged["period"] = merged["date"].dt.to_period("M").astype(str)
-    st.dataframe(merged, use_container_width=True, height=300)
-    st.download_button("Descargar CSV MRR (hist + forecast)", merged.to_csv(index=False).encode("utf-8"),
-                       file_name="mrr_hist_forecast.csv", mime="text/csv")
+        fig = plot_hist_fc(m_hist, m_fc, title=f"MRR (escenario: {scenario})", label_mode="extrema")
+        st.plotly_chart(fig, use_container_width=True)
 
-# =========================
-# Tab 2: Transacciones
-# =========================
+        # merge seguro (date ya es datetime en ambos)
+        ensure_datetime_naive(m_fc, "date")
+        merged = (m_hist.rename(columns={"value": "historico"})
+                  .merge(m_fc, on="date", how="outer")
+                  .sort_values("date"))
+        merged["period"] = merged["date"].dt.to_period("M").astype(str)
+
+        st.dataframe(merged, use_container_width=True, height=320)
+        st.download_button(
+            "Descargar CSV MRR (hist + forecast)",
+            merged.to_csv(index=False).encode("utf-8"),
+            file_name="mrr_hist_forecast.csv",
+            mime="text/csv",
+        )
+
+# ============================================================
+# Tab 2: Transactions
+# ============================================================
 with tabs[1]:
-    st.subheader("Transacciones — Histórico + Pronóstico (12 meses)")
-    scenario_tx = st.selectbox("Escenario TX", ["Base", "Pesimista (–10%)", "Optimista (+10%)"], index=0, key="sc_tx")
-    horizon_tx = st.slider("Horizonte TX (meses)", 3, 18, DEFAULT_HORIZON, 12, key="hr_tx")
+    st.subheader("Transactions — Histórico + Pronóstico")
 
-    t_hist = (fdata[fdata["metric"]=="Transactions"]
+    scenario_tx = st.selectbox("Escenario", ["Base", "Pesimista (–10%)", "Optimista (+10%)"], index=0, key="sc_tx")
+    horizon_tx = st.slider("Horizonte (meses)", 3, 18, DEFAULT_HORIZON, 1, key="hz_tx")
+
+    t_hist = (fdata[fdata["metric"] == "Transactions"]
               .groupby("date", as_index=False)["value"].sum()
               .sort_values("date"))
-    t_fc = fit_prophet_series(t_hist, horizon=horizon_tx)
-    t_fc = apply_scenario(t_fc, scenario_tx)
+    ensure_datetime_naive(t_hist, "date")
 
-    fig_tx = plot_hist_fc(t_hist, t_fc, title=f"Transacciones (escenario: {scenario_tx})", label_mode="none")
-    st.plotly_chart(fig_tx, use_container_width=True)
+    if t_hist.empty:
+        st.warning("No hay datos de Transactions con los filtros actuales. Revisa el gid o el nombre de columnas de meses.")
+        with st.expander("Debug Transactions"):
+            tx_only = fdata[fdata["metric"] == "Transactions"].copy()
+            st.write("Filas TX post-filtro:", len(tx_only))
+            st.write("Periodos TX (últimos 8):", sorted(tx_only["period"].dropna().unique().tolist())[-8:])
+    else:
+        t_fc = fit_prophet_series(t_hist, horizon=horizon_tx)
+        t_fc = apply_scenario(t_fc, scenario_tx)
 
-    merged_tx = t_hist.rename(columns={"value":"historico"}).merge(t_fc, on="date", how="outer").sort_values("date")
-    merged_tx["period"] = merged_tx["date"].dt.to_period("M").astype(str)
-    st.dataframe(merged_tx, use_container_width=True, height=300)
-    st.download_button("Descargar CSV TX (hist + forecast)", merged_tx.to_csv(index=False).encode("utf-8"),
-                       file_name="tx_hist_forecast.csv", mime="text/csv")
+        fig_tx = plot_hist_fc(t_hist, t_fc, title=f"Transactions (escenario: {scenario_tx})", label_mode="none")
+        st.plotly_chart(fig_tx, use_container_width=True)
 
-# =========================
+        ensure_datetime_naive(t_fc, "date")
+        merged_tx = (t_hist.rename(columns={"value": "historico"})
+                     .merge(t_fc, on="date", how="outer")
+                     .sort_values("date"))
+        merged_tx["period"] = merged_tx["date"].dt.to_period("M").astype(str)
+
+        st.dataframe(merged_tx, use_container_width=True, height=320)
+        st.download_button(
+            "Descargar CSV Transactions (hist + forecast)",
+            merged_tx.to_csv(index=False).encode("utf-8"),
+            file_name="transactions_hist_forecast.csv",
+            mime="text/csv",
+        )
+
+# ============================================================
 # Tab 3: Resumen por cuenta
-# =========================
-def per_account_forecast(df_metric: pd.DataFrame, horizon=12, scenario="Base") -> pd.DataFrame:
+# ============================================================
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
+def per_account_forecast(d: pd.DataFrame, metric: str, horizon: int, scenario: str) -> pd.DataFrame:
+    """
+    Calcula forecast por cuenta (por cliente).
+    Nota: Prophet por cliente puede ser pesado (costoso computacionalmente) si hay muchos clientes.
+    """
+    dm = d[d["metric"] == metric].copy()
+    if dm.empty:
+        return pd.DataFrame(columns=[
+            "cliente", "ultimo_periodo", "ultimo_valor", "forecast_proximo_mes", "forecast_12_meses", "riesgo_caida"
+        ])
+
+    last_per = dm["period"].max()
     rows = []
-    # último periodo disponible global (para “último valor”)
-    last_per = df_metric["period"].max()
-    for cli, sub in df_metric.groupby("cliente"):
+
+    for cli, sub in dm.groupby("cliente"):
         s = sub.groupby("date", as_index=False)["value"].sum().sort_values("date")
+        ensure_datetime_naive(s, "date")
+
         fc = fit_prophet_series(s, horizon=horizon)
         fc = apply_scenario(fc, scenario)
-        last_val = float(sub.loc[sub["period"]==last_per, "value"].sum())
-        next_month = fc["yhat"].iloc[0] if not fc.empty else np.nan
-        sum_12 = fc["yhat"].sum() if not fc.empty else np.nan
 
-        # bandera simple de riesgo: caída del último mes vs promedio 3 meses previos >40%
-        risk = None
+        last_val = float(sub.loc[sub["period"] == last_per, "value"].sum())
+        next_month = float(fc["yhat"].iloc[0]) if not fc.empty else np.nan
+        sum_h = float(fc["yhat"].sum()) if not fc.empty else np.nan
+
+        # regla simple de riesgo: último mes < 60% del promedio de los 3 previos
+        risk = False
         if len(s) >= 4:
-            last_hist = s["value"].iloc[-1]
-            prev3 = s["value"].iloc[-4:-1].mean()
+            last_hist = float(s["value"].iloc[-1])
+            prev3 = float(s["value"].iloc[-4:-1].mean())
             risk = (prev3 > 0 and (last_hist < 0.6 * prev3))
 
         rows.append({
             "cliente": cli,
             "ultimo_periodo": last_per,
             "ultimo_valor": round(last_val, 2),
-            "forecast_proximo_mes": round(float(next_month), 2) if pd.notna(next_month) else None,
-            "forecast_12_meses": round(float(sum_12), 2) if pd.notna(sum_12) else None,
-            "riesgo_caida": bool(risk) if risk is not None else False
+            "forecast_proximo_mes": round(next_month, 2) if pd.notna(next_month) else None,
+            "forecast_12_meses": round(sum_h, 2) if pd.notna(sum_h) else None,
+            "riesgo_caida": bool(risk),
         })
+
     out = pd.DataFrame(rows)
-    return out.sort_values("forecast_12_meses", ascending=False)
+    # ordenar por forecast
+    if "forecast_12_meses" in out.columns:
+        out = out.sort_values("forecast_12_meses", ascending=False, na_position="last")
+    return out
 
 with tabs[2]:
-    st.subheader("Resumen por cuenta (MRR y Transacciones)")
-    scenario_tbl = st.selectbox("Escenario tabla", ["Base", "Pesimista (–10%)", "Optimista (+10%)"], index=0, key="sc_tbl")
-    horizon_tbl = st.slider("Horizonte tabla (meses)", 3, 18, DEFAULT_HORIZON, 12, key="hr_tbl")
+    st.subheader("Resumen por cuenta — Forecast")
 
-    mrr_acc = per_account_forecast(fdata[fdata["metric"]=="MRR"], horizon=horizon_tbl, scenario=scenario_tbl)
-    tx_acc  = per_account_forecast(fdata[fdata["metric"]=="Transactions"], horizon=horizon_tbl, scenario=scenario_tbl)
+    scenario_tbl = st.selectbox("Escenario", ["Base", "Pesimista (–10%)", "Optimista (+10%)"], index=0, key="sc_tbl")
+    horizon_tbl = st.slider("Horizonte (meses)", 3, 18, DEFAULT_HORIZON, 1, key="hz_tbl")
 
     col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**MRR — Tabla por cuenta (ordenada por forecast 12m)**")
-        st.dataframe(mrr_acc, use_container_width=True, height=420)
-        st.download_button("Descargar CSV MRR por cuenta", mrr_acc.to_csv(index=False).encode("utf-8"),
-                           file_name="mrr_por_cuenta.csv", mime="text/csv")
-    with col2:
-        st.markdown("**Transacciones — Tabla por cuenta (ordenada por forecast 12m)**")
-        st.dataframe(tx_acc, use_container_width=True, height=420)
-        st.download_button("Descargar CSV TX por cuenta", tx_acc.to_csv(index=False).encode("utf-8"),
-                           file_name="tx_por_cuenta.csv", mime="text/csv")
 
-# Debug opcional
-with st.expander("Debug (últimos periodos detectados)"):
-    per = sorted(data["period"].dropna().unique().tolist())[-6:]
-    st.write(per)
+    with col1:
+        st.markdown("### MRR — por cuenta")
+        mrr_acc = per_account_forecast(fdata, "MRR", horizon_tbl, scenario_tbl)
+        st.dataframe(mrr_acc, use_container_width=True, height=420)
+        st.download_button(
+            "Descargar CSV MRR por cuenta",
+            mrr_acc.to_csv(index=False).encode("utf-8"),
+            file_name="mrr_por_cuenta.csv",
+            mime="text/csv",
+        )
+
+    with col2:
+        st.markdown("### Transactions — por cuenta")
+        tx_acc = per_account_forecast(fdata, "Transactions", horizon_tbl, scenario_tbl)
+        st.dataframe(tx_acc, use_container_width=True, height=420)
+        st.download_button(
+            "Descargar CSV Transactions por cuenta",
+            tx_acc.to_csv(index=False).encode("utf-8"),
+            file_name="transactions_por_cuenta.csv",
+            mime="text/csv",
+        )
+
+with st.expander("Debug general (últimos periodos detectados)"):
+    for met in ["MRR", "Transactions"]:
+        dm = data[data["metric"] == met]
+        periods = sorted(dm["period"].dropna().unique().tolist())
+        st.write(f"{met}: últimos periodos:", periods[-8:])
+        st.write(f"{met}: últimos 3 meses (total):",
+                 dm.groupby("period")["value"].sum().sort_index().tail(3))
