@@ -235,11 +235,10 @@ def load_all() -> pd.DataFrame:
 # ============================================================
 # Forecast (Prophet)
 # ============================================================
-def fit_prophet_series(series_df: pd.DataFrame, horizon=12) -> pd.DataFrame:
+def fit_prophet_predict_dates(series_df: pd.DataFrame, future_dates: pd.DatetimeIndex) -> pd.DataFrame:
     """
-    series_df: columnas ['date','value']
-    retorna: ['date','yhat','yhat_lower','yhat_upper']
-    Nota: devuelve DF vacío con dtypes correctos para evitar errores en merge (unión de tablas).
+    Ajusta Prophet y predice exactamente sobre las fechas entregadas (future_dates).
+    Retorna: ['date','yhat','yhat_lower','yhat_upper']
     """
     s = series_df.dropna().copy()
     ensure_datetime_naive(s, "date")
@@ -262,7 +261,8 @@ def fit_prophet_series(series_df: pd.DataFrame, horizon=12) -> pd.DataFrame:
         daily_seasonality=False
     )
     m.fit(s.rename(columns={"date": "ds", "value": "y"}))
-    fut = m.make_future_dataframe(periods=horizon, freq="MS", include_history=False)
+
+    fut = pd.DataFrame({"ds": pd.to_datetime(future_dates)})
     fc = m.predict(fut)
 
     out = pd.DataFrame({
@@ -272,6 +272,59 @@ def fit_prophet_series(series_df: pd.DataFrame, horizon=12) -> pd.DataFrame:
         "yhat_upper": fc["yhat_upper"].astype(float),
     })
     ensure_datetime_naive(out, "date")
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=CACHE_TTL)
+def per_account_forecast_matrix(d: pd.DataFrame, metric: str, horizon: int, scenario: str) -> pd.DataFrame:
+    """
+    Tabla mensual por cuenta (matriz): Col A = cliente, Col B.. = meses del forecast.
+    Es responsive al escenario (se actualiza con scenario/horizon/filtros).
+    """
+    dm = d[d["metric"] == metric].copy()
+    if dm.empty:
+        return pd.DataFrame(columns=["cliente"])
+
+    # Definimos un calendario común para todas las cuentas (mismos meses para todos)
+    ensure_datetime_naive(dm, "date")
+    last_date = dm["date"].max()
+    if pd.isna(last_date):
+        return pd.DataFrame(columns=["cliente"])
+
+    last_month_start = pd.to_datetime(last_date).to_period("M").to_timestamp()  # inicio del mes
+    start_fc = last_month_start + pd.offsets.MonthBegin(1)  # siguiente mes
+    months = pd.date_range(start_fc, periods=int(horizon), freq="MS")
+
+    month_cols = [m.strftime("%Y-%m") for m in months]  # headers claros
+    rows = []
+
+    for cli, sub in dm.groupby("cliente"):
+        s = sub.groupby("date", as_index=False)["value"].sum().sort_values("date")
+        ensure_datetime_naive(s, "date")
+
+        fc = fit_prophet_predict_dates(s, months)
+        fc = apply_scenario(fc, scenario)
+
+        row = {"cliente": cli}
+        if fc.empty:
+            for c in month_cols:
+                row[c] = None
+        else:
+            fc_map = dict(zip(fc["date"].dt.to_period("M").astype(str), fc["yhat"]))
+            for m in months:
+                key = str(m.to_period("M"))
+                col = m.strftime("%Y-%m")
+                row[col] = float(fc_map.get(key)) if key in fc_map else None
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+
+    # Orden útil: mayor forecast total al inicio
+    if month_cols:
+        out["_sum"] = out[month_cols].sum(axis=1, numeric_only=True)
+        out = out.sort_values("_sum", ascending=False, na_position="last").drop(columns=["_sum"])
+
     return out
 
 def apply_scenario(fc: pd.DataFrame, scenario: str) -> pd.DataFrame:
